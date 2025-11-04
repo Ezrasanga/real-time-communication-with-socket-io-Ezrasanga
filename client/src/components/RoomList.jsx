@@ -127,6 +127,12 @@ React.useEffect(() => {
     };
 }, [availableRooms, localCurrent, newRoom, onJoinRoom, onLeaveRoom]);
 
+const handleLeaveRoom = (room) => {
+  if (socket) {
+    socket.emit('leaveRoom', { room });
+  }
+};
+
 return (
 <div className="room-list">
 <h4>Rooms</h4>

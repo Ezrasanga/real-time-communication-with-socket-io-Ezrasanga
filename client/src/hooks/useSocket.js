@@ -11,7 +11,20 @@ const [typing, setTyping] = useState([]);
 
 
 useEffect(() => {
-socketRef.current = io(url, { autoConnect: true });
+  const socketUrl = url || process.env.REACT_APP_SOCKET_URL || 'http://localhost:5000';
+  console.log('useSocket connecting to:', socketUrl); // <-- confirm URL in browser console
+
+  socketRef.current = io(
+    socketUrl,
+    { 
+      autoConnect: true,
+      withCredentials: true,
+      // try polling first so failures to upgrade don't immediately blow up
+      transports: ['polling', 'websocket']
+    }
+  );
+
+  console.log('socket client opts:', socketRef.current.io?.opts);
 
 
 socketRef.current.on('connect', () => setConnected(true));
