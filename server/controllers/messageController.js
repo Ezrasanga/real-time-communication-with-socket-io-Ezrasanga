@@ -1,4 +1,5 @@
 const Message = require('../models/Message');
+const Room = require('../models/Room');
 
 exports.getMessages = async (req, res) => {
   try {
@@ -34,5 +35,39 @@ exports.createMessage = async (req, res) => {
   } catch (err) {
     console.error('createMessage error:', err);
     res.status(500).json({ error: 'Failed to create message' });
+  }
+};
+
+// delete a message (room or private)
+exports.deleteMessage = async (req, res) => {
+  try {
+    const id = req.params.id;
+    const msg = await Message.findById(id).lean();
+    if (!msg) return res.status(404).json({ error: 'Message not found' });
+
+    // only allow deletion by message author or room creator
+    const requester = req.clerkUser?.username || req.clerkUser?.id;
+    const isAuthor = msg.from === requester || String(msg.createdBy) === String(req.clerkUser?.id);
+    let isRoomCreator = false;
+    if (msg.room) {
+      const room = await Room.findOne({ name: msg.room }).lean();
+      if (room && (String(room.createdBy) === String(req.clerkUser?.id) || String(room.createdBy) === String(requester))) isRoomCreator = true;
+    }
+    if (!isAuthor && !isRoomCreator) {
+      return res.status(403).json({ error: 'Not authorized to delete this message' });
+    }
+
+    await Message.deleteOne({ _id: id });
+
+    // broadcast deletion so clients can remove it
+    const io = req.app.get('io');
+    if (io) {
+      io.emit('messageDeleted', { messageId: id, room: msg.room || null, private: !!msg.private, from: msg.from, to: msg.to || null });
+    }
+
+    return res.json({ ok: true, messageId: id });
+  } catch (err) {
+    console.error('deleteMessage error', err);
+    return res.status(500).json({ error: err.message || 'Server error' });
   }
 };
