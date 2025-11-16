@@ -12,6 +12,9 @@ const MESSAGES = []; // {id, room, senderId, senderName, text, timestamp, reacti
 const ONLINE = new Map(); // socketId -> {userId, userName}
 const USERS_BY_ID = new Map(); // userId -> {userName, sockets: Set(socketId)}
 
+// New: Rooms store (in-memory demo)
+const ROOMS = new Map(); // roomName -> { name, messages: [{...}], createdBy, createdAt }
+
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: true },
@@ -29,6 +32,11 @@ function verifyTokenStub(token) {
   const userId = token.slice(0, 8);
   const userName = `user-${userId}`;
   return { userId, userName };
+}
+
+// Helper to list rooms as array
+function listRooms() {
+  return Array.from(ROOMS.entries()).map(([name, info]) => ({ name: info.name, createdBy: info.createdBy, createdAt: info.createdAt, count: info.messages.length }));
 }
 
 io.on("connection", (socket) => {
@@ -60,12 +68,18 @@ io.on("connection", (socket) => {
   // Join global room by default
   socket.join(GLOBAL_ROOM);
 
-  // Emit users to the connecting socket immediately (ensure initial sync)
+  // Emit rooms list immediately
+  socket.emit("rooms", listRooms());
+
+  // Emit initial users and recent global messages
   (function emitInitialUsers() {
     const users = Array.from(USERS_BY_ID.entries()).map(([id, info]) => ({ id, name: info.userName, online: info.sockets.size > 0 }));
     console.info("[users] emitInitialUsers ->", users.length);
     socket.emit("users", users);
   })();
+
+  const recent = MESSAGES.slice(-50);
+  socket.emit("recent_messages", recent);
 
   // Notify current online list to all clients
   function broadcastUsers() {
@@ -75,16 +89,62 @@ io.on("connection", (socket) => {
   }
   broadcastUsers();
 
-  // Send recent messages (initial sync)
-  const recent = MESSAGES.slice(-50);
-  socket.emit("recent_messages", recent);
-
   // Notify join
   io.to(GLOBAL_ROOM).emit("notification", { type: "user_join", user: { id: user.userId, name: user.userName } });
 
+  // ROOM: create room via socket
+  socket.on("create_room", ({ name }, ack) => {
+    if (!name) return ack && ack({ ok: false, error: "name required" });
+    if (ROOMS.has(name)) return ack && ack({ ok: false, error: "room exists" });
+    ROOMS.set(name, { name, createdBy: user.userId, createdAt: Date.now(), messages: [] });
+    // broadcast new rooms list
+    io.emit("rooms", listRooms());
+    if (typeof ack === "function") ack({ ok: true, room: ROOMS.get(name) });
+  });
+
+  // ROOM: join room
+  socket.on("join_room", ({ room }, ack) => {
+    if (!room) return ack && ack({ ok: false, error: "room required" });
+    // ensure room exists
+    if (!ROOMS.has(room)) {
+      // create on-demand (optional) or return error
+      ROOMS.set(room, { name: room, createdBy: user.userId, createdAt: Date.now(), messages: [] });
+      io.emit("rooms", listRooms());
+    }
+    socket.join(room);
+
+    // send recent messages for that room
+    const roomMsgs = ROOMS.get(room).messages.slice(-100);
+    socket.emit("room_messages", { room, messages: roomMsgs });
+
+    // compute users in room (by socket ids in adapter)
+    const socketsInRoom = io.sockets.adapter.rooms.get(room) || new Set();
+    const roomUsers = Array.from(socketsInRoom).map((sid) => {
+      const online = ONLINE.get(sid);
+      return online ? { id: online.userId, name: online.userName } : null;
+    }).filter(Boolean);
+
+    io.to(room).emit("room_users", { room, users: roomUsers });
+
+    if (typeof ack === "function") ack({ ok: true, room, messages: roomMsgs });
+  });
+
+  // ROOM: leave room
+  socket.on("leave_room", ({ room }, ack) => {
+    if (!room) return ack && ack({ ok: false, error: "room required" });
+    socket.leave(room);
+    // recompute and broadcast room users
+    const socketsInRoom = io.sockets.adapter.rooms.get(room) || new Set();
+    const roomUsers = Array.from(socketsInRoom).map((sid) => {
+      const online = ONLINE.get(sid);
+      return online ? { id: online.userId, name: online.userName } : null;
+    }).filter(Boolean);
+    io.to(room).emit("room_users", { room, users: roomUsers });
+    if (typeof ack === "function") ack({ ok: true, room });
+  });
+
   // Handle incoming global message
   socket.on("message", (payload, ack) => {
-    // payload: {room, text}
     const msg = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2,8)}`,
       room: payload.room || GLOBAL_ROOM,
@@ -99,7 +159,14 @@ io.on("connection", (socket) => {
     // Keep memory bounded (demo)
     if (MESSAGES.length > 2000) MESSAGES.shift();
 
-    // Broadcast to room
+    // store if room is tracked
+    if (ROOMS.has(msg.room)) {
+      ROOMS.get(msg.room).messages.push(msg);
+      // keep bounded
+      if (ROOMS.get(msg.room).messages.length > 2000) ROOMS.get(msg.room).messages.shift();
+    }
+
+    // Broadcast to the room (works for global and named rooms)
     io.to(msg.room).emit("message", msg);
     // Ack to sender
     if (typeof ack === "function") ack({ ok: true, id: msg.id, ts: msg.timestamp });
@@ -164,8 +231,9 @@ io.on("connection", (socket) => {
         io.emit("notification", { type: "user_leave", user: { id: user.userId, name: user.userName } });
       }
     }
-    // broadcast updated list
-    broadcastUsers();
+    // broadcast updated users and rooms (rooms don't auto-delete here)
+    const users = Array.from(USERS_BY_ID.entries()).map(([id, info]) => ({ id, name: info.userName, online: info.sockets.size > 0 }));
+    io.emit("users", users);
   });
 });
 
@@ -176,6 +244,18 @@ app.get("/", (req, res) => {
 
 // Minimal health endpoint
 app.get("/health", (req, res) => res.json({ ok: true, ts: Date.now() }));
+app.get("/rooms", (req, res) => {
+  res.json({ ok: true, rooms: listRooms() });
+});
+app.post("/rooms", (req, res) => {
+  const { name, createdBy } = req.body || {};
+  if (!name) return res.status(400).json({ ok: false, error: "name required" });
+  if (ROOMS.has(name)) return res.status(409).json({ ok: false, error: "room exists" });
+  ROOMS.set(name, { name, createdBy: createdBy || "unknown", createdAt: Date.now(), messages: [] });
+  // broadcast rooms update
+  io.emit("rooms", listRooms());
+  return res.json({ ok: true, room: ROOMS.get(name) });
+});
 
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {

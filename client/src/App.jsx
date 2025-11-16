@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from "react";
+import React, { useEffect, useRef, useState, useCallback } from "react";
 import {
   SignedIn,
   SignedOut,
@@ -34,6 +34,8 @@ export default function App() {
 	const [socketInstance, setSocketInstance] = useState(null);
 	const [connectionStatus, setConnectionStatus] = useState("disconnected");
 	const [lastError, setLastError] = useState(null);
+	const [rooms, setRooms] = useState([]);
+	const [currentRoom, setCurrentRoom] = useState("global");
 	const messageListRef = useRef(null);
 	const typingTimeoutRef = useRef(null);
 	const lastTsRef = useRef(Date.now());
@@ -106,6 +108,25 @@ export default function App() {
 			s.on("message", (msg) => {
 				setMessages((prev) => [...prev, msg]);
 			});
+			s.on("rooms", (r) => {
+				console.info("[socket] rooms:", r);
+				setRooms(Array.isArray(r) ? r : []);
+			});
+			s.on("room_messages", ({ room, messages: roomMsgs }) => {
+				console.info("[socket] room_messages", room, roomMsgs?.length);
+				if (!Array.isArray(roomMsgs)) return;
+				// merge room messages into messages store (dedupe)
+				setMessages((prev) => {
+					const map = new Map(prev.map((m) => [m.id, m]));
+					roomMsgs.forEach((m) => map.set(m.id, m));
+					return Array.from(map.values()).sort((a, b) => a.timestamp - b.timestamp);
+				});
+			});
+			s.on("room_users", ({ room, users: ru }) => {
+				console.info("[socket] room_users", room, ru);
+				// optional: surface per-room users; for now merge into onlineUsers if useful
+			});
+
 			s.connect();
 			setSocketInstance(s);
 		} catch (e) {
@@ -123,12 +144,12 @@ export default function App() {
 		}
 		const text = (input || "").trim();
 		if (!text) return;
-		socketInstance.emit("message", { room: "global", text }, (ack) => {
+		socketInstance.emit("message", { room: currentRoom || "global", text }, (ack) => {
 			// optional: handle ack
 			// console.info("message ack", ack);
 		});
 		setInput("");
-	}, [socketInstance, input]);
+	}, [socketInstance, input, currentRoom]);
 	// --- end added ---
 
   // Typing events (debounced)
@@ -224,6 +245,56 @@ export default function App() {
 		}
 	};
 
+	// Create room (prompt or input-based)
+	const createRoom = async () => {
+		const name = prompt("Room name:");
+		if (!name) return;
+		socket?.emit("create_room", { name }, (res) => {
+			if (res?.ok) {
+				setCurrentRoom(name);
+				// auto-join newly created room
+				socket.emit("join_room", { room: name }, (r) => {
+					console.info("joined new room", r);
+				});
+			} else {
+				alert("Failed to create room: " + (res?.error || "unknown"));
+			}
+		});
+	};
+
+	// Join room
+	const joinRoom = (room) => {
+		if (!socket) {
+			alert("Not connected");
+			return;
+		}
+		socket.emit("join_room", { room }, (res) => {
+			if (res?.ok) {
+				setCurrentRoom(room);
+				// room messages will arrive via room_messages handler
+			} else {
+				console.warn("join_room failed", res);
+				alert("Failed to join room: " + (res?.error || "unknown"));
+			}
+		});
+	};
+
+	// Leave room
+	const leaveRoom = (room) => {
+		if (!socket) return;
+		if (room === "global") return alert("Cannot leave global room");
+		socket.emit("leave_room", { room }, (res) => {
+			if (res?.ok) {
+				setCurrentRoom("global");
+			} else {
+				console.warn("leave_room failed", res);
+			}
+		});
+	};
+
+	// Render messages filtered by currentRoom
+	const visibleMessages = messages.filter((m) => (m.room || "global") === (currentRoom || "global"));
+
 	return (
 		<>
 			<SignedIn>
@@ -252,22 +323,21 @@ export default function App() {
 						<div className="layout">
 							<aside className="sidebar">
 								<div className="users-card">
-									<h4>Users</h4>
+									<h4>Rooms</h4>
+									<div style={{display:'flex', gap:8, marginBottom:8}}>
+										<button className="btn btn-primary btn--small" onClick={createRoom}>New Room</button>
+										<button className="btn btn-ghost btn--small" onClick={() => joinRoom('global')}>Global</button>
+									</div>
 									<div className="users-list">
-										{onlineUsers.length === 0 ? (
-											<div className="empty">No users yet</div>
-										) : (
-											onlineUsers.map((u) => (
-												<div className="user-row" key={u.id}>
-													<div className="avatar">{initials(u.name)}</div>
-													<div className="user-meta">
-														<div className="user-name">{u.name}</div>
-														<div className="user-status">{u.online ? "Online" : "Offline"}</div>
-													</div>
-													<div style={{ marginLeft: "auto", fontSize: 12, color: "var(--muted)" }}>{u.online ? "●" : "○"}</div>
+										{rooms.map(r => (
+											<div key={r.name} style={{display:'flex', alignItems:'center', gap:8, padding:8, borderRadius:8}}>
+												<div style={{fontWeight:700}}>{r.name}</div>
+												<div style={{marginLeft:'auto', display:'flex', gap:8}}>
+													<button className="btn btn-ghost btn--small" onClick={() => joinRoom(r.name)}>Join</button>
+													{currentRoom === r.name && r.name !== 'global' && <button className="btn btn-outline btn--small" onClick={() => leaveRoom(r.name)}>Leave</button>}
 												</div>
-											))
-										)}
+											</div>
+										))}
 									</div>
 								</div>
 							</aside>
@@ -280,10 +350,10 @@ export default function App() {
 
 								<div className="chat-card">
 									<div className="message-list" ref={messageListRef}>
-										{messages.length === 0 ? (
+										{visibleMessages.length === 0 ? (
 											<div className="empty">No messages yet</div>
 										) : (
-											messages.map((m) => {
+											visibleMessages.map((m) => {
 												const sent = m.senderId === user?.id || m.senderId === user?.userId;
 												return (
 													<div key={m.id} className={`message-bubble ${sent ? "message-sent" : "message-recv"}`}>
