@@ -2,17 +2,15 @@ import { io } from "socket.io-client";
 
 export function createSocket(token, user) {
   const base = import.meta.env.VITE_SERVER_URL || import.meta.env.VITE_SOCKET_URL || "http://localhost:5000";
-  // include stable user id + name in auth so server can dedupe users reliably
   const socket = io(base, {
     path: "/socket.io",
-    auth: { token, userId: user?.id, userName: user?.fullName },
+    auth: { token, userId: user?.id, userName: user?.fullName || user?.name },
     transports: ["polling", "websocket"],
     autoConnect: false,
     reconnectionAttempts: 5,
     reconnectionDelay: 1000,
   });
 
-  // Helpful debug listeners (will print in browser console)
   socket.on("connect", () => {
     console.info("[socket] connected", socket.id, "->", base);
   });

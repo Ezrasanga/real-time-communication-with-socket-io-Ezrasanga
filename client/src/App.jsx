@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useCallback } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   SignedIn,
   SignedOut,
@@ -9,386 +9,442 @@ import {
   useUser,
   useAuth,
 } from "@clerk/clerk-react";
-
-// import socket helper if present; will be used only on manual connect
 import { createSocket } from "./socket";
+import "./styles.css";
 
-const URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:5000';
-
-// --- UI helper: initials avatar generator ---
+// small helper to render initials
 function initials(name) {
-		if (!name) return "U";
-		return name
-			.split(" ")
-			.map((p) => p[0])
-			.slice(0, 2)
-			.join("")
-			.toUpperCase();
+  if (!name) return "U";
+  return name
+    .split(" ")
+    .map((p) => p[0])
+    .slice(0, 2)
+    .join("")
+    .toUpperCase();
 }
 
 export default function App() {
-	// minimal, defensive state to avoid undefined references
-	const [messages, setMessages] = useState([]);
-	const [onlineUsers, setOnlineUsers] = useState([]);
-	const [input, setInput] = useState("");
-	const [socketInstance, setSocketInstance] = useState(null);
-	const [connectionStatus, setConnectionStatus] = useState("disconnected");
-	const [lastError, setLastError] = useState(null);
-	const [rooms, setRooms] = useState([]);
-	const [currentRoom, setCurrentRoom] = useState("global");
-	const messageListRef = useRef(null);
-	const typingTimeoutRef = useRef(null);
-	const lastTsRef = useRef(Date.now());
+  // Clerk
+  const { user } = useUser() || {};
+  const { getToken } = useAuth();
 
-	const { user } = useUser() || {};
-	const { getToken } = useAuth();
+  // Canonical socket ref + state
+  const socketRef = useRef(null);
+  const [connected, setConnected] = useState(false);
+  const [lastError, setLastError] = useState(null);
 
-	const appName = import.meta.env.VITE_APP_NAME || "Realtime App";
+  // App data
+  const [rooms, setRooms] = useState([]);
+  const [onlineUsers, setOnlineUsers] = useState([]);
+  const [messages, setMessages] = useState([]);
+  const [currentRoom, setCurrentRoom] = useState("global");
+  const [input, setInput] = useState("");
+  const [onlineCount, setOnlineCount] = useState(0); // new
 
-	// --- Added: ensure messages/input state and refs exist to avoid ReferenceErrors ---
-	// --- end added ---
+  const appName = import.meta.env.VITE_APP_NAME || "Realtime App";
 
-  // Utility: browser notification
-  const notify = useCallback((title, opts) => {
+  // register socket and attach all handlers in one place
+  const registerSocket = useCallback((s) => {
+    if (!s) return;
+    const prev = socketRef.current;
+    if (prev && prev !== s) {
+      try { prev.removeAllListeners(); prev.disconnect(); } catch (e) {}
+    }
+    socketRef.current = s;
+
+    // clear previous listeners defensively
     try {
-      if (("Notification" in window) && Notification.permission === "granted") {
-        new Notification(title, opts);
+      s.off && s.off();
+    } catch (e) {}
+
+    // Connection lifecycle
+    s.on("connect", () => {
+      console.info("[app] socket connected", s.id);
+      setConnected(true);
+      setLastError(null);
+      // request a fresh rooms/users snapshot
+      try { s.emit("rooms_request", null); } catch (e) {}
+    });
+    s.on("disconnect", (reason) => {
+      console.info("[app] socket disconnected", reason);
+      setConnected(false);
+    });
+    s.on("connect_error", (err) => {
+      console.error("[app] socket connect_error", err && err.message);
+      setLastError(err?.message || String(err));
+      setConnected(false);
+    });
+
+    // domain events
+    s.on("rooms", (r) => setRooms(Array.isArray(r) ? r : []));
+    s.on("users", (u) => {
+      setOnlineUsers(Array.isArray(u) ? u : []);
+      // keep onlineCount in sync if server didn't send users_count
+      try {
+        const inferred = Array.isArray(u) ? u.filter(x => x.online).length : 0;
+        setOnlineCount(inferred);
+      } catch {}
+    });
+    s.on("recent_messages", (recent) => {
+      if (!Array.isArray(recent)) return;
+      setMessages((prev) => {
+        const map = new Map(prev.map((m) => [m.id, m]));
+        recent.forEach((m) => map.set(m.id, m));
+        return Array.from(map.values()).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+      });
+    });
+    s.on("room_messages", ({ room, messages: roomMsgs }) => {
+      if (!Array.isArray(roomMsgs)) return;
+      setMessages((prev) => {
+        const map = new Map(prev.map((m) => [m.id, m]));
+        roomMsgs.forEach((m) => map.set(m.id, m));
+        return Array.from(map.values()).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+      });
+    });
+    s.on("message", (msg) => {
+      setMessages((prev) => {
+        if (prev.some((m) => m.id === msg.id)) return prev;
+        return [...prev, msg].sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+      });
+    });
+    s.on("private_message", (msg) => {
+      setMessages((prev) => {
+        if (prev.some((m) => m.id === msg.id)) return prev;
+        return [...prev, { ...msg, private: true }].sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+      });
+      try {
+        if (("Notification" in window) && Notification.permission === "granted") {
+          new Notification(`PM from ${msg.senderName}`, { body: msg.text });
+        }
+      } catch {}
+    });
+    s.on("message_read", ({ messageId, userId }) => {
+      setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, readBy: Array.from(new Set([...(m.readBy || []), userId])) } : m)));
+    });
+    // new: authoritative count from server
+    s.on("users_count", (count) => {
+      setOnlineCount(Number(count) || 0);
+    });
+
+    // ensure server snapshot sent if client asked
+    try { s.emit("rooms_request", null); } catch (e) { /* ignore */ }
+  }, []);
+
+  // initialize socket when user signs in
+  useEffect(() => {
+    if (!user) {
+      if (socketRef.current) {
+        try { socketRef.current.removeAllListeners(); socketRef.current.disconnect(); } catch (e) {}
+        socketRef.current = null;
       }
-    } catch (e) {
-      // ignore
+      setConnected(false);
+      return;
     }
-  }, []);
 
-  useEffect(() => {
-    if (("Notification" in window) && Notification.permission === "default") {
-      Notification.requestPermission();
-    }
-  }, []);
+    let mounted = true;
+    (async () => {
+      setLastError(null);
+      try {
+        const token = await getToken().catch(() => null);
+        const userPayload = { id: user?.id, fullName: user?.fullName || user?.firstName || user?.primaryEmailAddress?.emailAddress || "User" };
+        const s = createSocket(token, userPayload);
+        if (!mounted) return;
+        registerSocket(s);
 
-	// Manual connect to avoid unexpected automatic errors
-	const handleConnect = async () => {
-		setLastError(null);
-		setConnectionStatus("connecting");
-		let token = null;
-		try {
-			token = await getToken();
-			console.info("[auth] token present:", !!token, token ? `${String(token).slice(0,8)}...` : "none");
-		} catch (e) {
-			console.error("[auth] getToken failed:", e);
-			setLastError("getToken failed: " + (e?.message || e));
-			setConnectionStatus("error");
-			return;
-		}
-
-		try {
-			// determine a stable user payload to send to the server
-			const userPayload = {
-				id: user?.id, // Clerk user id
-				fullName: user?.fullName || user?.firstName || user?.primaryEmailAddress?.emailAddress || "Unknown",
-			};
-			const s = createSocket(token, userPayload);
-			// attach minimal listeners so UI updates
-			s.on("connect", () => {
-				console.info("[socket] connected", s.id);
-				setConnectionStatus("connected");
-			});
-			s.on("connect_error", (err) => {
-				console.error("[socket] connect_error", err && err.message, err);
-				setLastError(err?.message || String(err));
-				setConnectionStatus("error");
-			});
-			s.on("disconnect", (reason) => {
-				console.info("[socket] disconnected", reason);
-				setConnectionStatus("disconnected");
-			});
-			s.on("users", (users) => {
-				console.info("[socket] users", users);
-				if (Array.isArray(users)) setOnlineUsers(users);
-			});
-			s.on("message", (msg) => {
-				setMessages((prev) => [...prev, msg]);
-			});
-			s.on("rooms", (r) => {
-				console.info("[socket] rooms:", r);
-				setRooms(Array.isArray(r) ? r : []);
-			});
-			s.on("room_messages", ({ room, messages: roomMsgs }) => {
-				console.info("[socket] room_messages", room, roomMsgs?.length);
-				if (!Array.isArray(roomMsgs)) return;
-				// merge room messages into messages store (dedupe)
-				setMessages((prev) => {
-					const map = new Map(prev.map((m) => [m.id, m]));
-					roomMsgs.forEach((m) => map.set(m.id, m));
-					return Array.from(map.values()).sort((a, b) => a.timestamp - b.timestamp);
-				});
-			});
-			s.on("room_users", ({ room, users: ru }) => {
-				console.info("[socket] room_users", room, ru);
-				// optional: surface per-room users; for now merge into onlineUsers if useful
-			});
-
-			s.connect();
-			setSocketInstance(s);
-		} catch (e) {
-			console.error("[socket] create/connect failed", e);
-			setLastError(e?.message || String(e));
-			setConnectionStatus("error");
-		}
-	};
-
-	// --- Added: safe sendMessage that guards against undefined/empty input ---
-	const sendMessage = useCallback(() => {
-		if (!socketInstance) {
-			setLastError("Not connected");
-			return;
-		}
-		const text = (input || "").trim();
-		if (!text) return;
-		socketInstance.emit("message", { room: currentRoom || "global", text }, (ack) => {
-			// optional: handle ack
-			// console.info("message ack", ack);
-		});
-		setInput("");
-	}, [socketInstance, input, currentRoom]);
-	// --- end added ---
-
-  // Typing events (debounced)
-  useEffect(() => {
-    if (!socketInstance) return;
-    socketInstance.emit("typing", { room: "global", isTyping: Boolean(input) });
-    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
-    typingTimeoutRef.current = setTimeout(() => {
-      socketInstance.emit("typing", { room: "global", isTyping: false });
-    }, 1200);
-    return () => {
-      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
-    };
-  }, [input, socketInstance]);
-
-  // Load older messages (pagination)
-  const loadOlder = () => {
-    if (!socketInstance || loadingOlder || !hasMore) return;
-    setLoadingOlder(true);
-    const beforeTs = messages.length ? messages[0].timestamp : Date.now();
-    socketInstance.emit("load_older", { room: "global", beforeTimestamp: beforeTs, limit: 30 }, (res) => {
-      if (res?.ok && Array.isArray(res.messages)) {
-        setMessages((prev) => {
-          const merged = [...res.messages, ...prev];
-          // dedupe
-          const map = new Map();
-          merged.forEach((m) => map.set(m.id, m));
-          return Array.from(map.values()).sort((a, b) => a.timestamp - b.timestamp);
+        // NEW: ensure the server knows who joined and which room to join
+        s.once("connect", () => {
+          try {
+            const uname = user?.fullName || user?.firstName || user?.primaryEmailAddress?.emailAddress || user?.id || "Anonymous";
+            // announce presence (server tracks online users)
+            s.emit("join", { username: uname });
+            // ensure we join the current room (default 'global')
+            s.emit("join_room", { room: currentRoom || "global" });
+          } catch (e) {
+            console.warn("[app] join emit failed", e);
+          }
         });
-        if (res.messages.length < 30) setHasMore(false);
+
+        s.connect();
+      } catch (err) {
+        console.error("[app] init socket failed", err);
+        setLastError(String(err));
       }
-      setLoadingOlder(false);
+    })();
+
+    return () => { mounted = false; };
+  }, [user, getToken, registerSocket /* intentionally not adding currentRoom to avoid re-init loops */]);
+
+  // derive visible messages for current room
+  const visibleMessages = messages.filter((m) => (m.room || "global") === (currentRoom || "global"));
+
+  // mark visible messages as read (avoid marking own messages)
+  useEffect(() => {
+    const s = socketRef.current;
+    if (!s || !connected) return;
+    const myId = user?.id || user?.userId;
+    visibleMessages.forEach((m) => {
+      if (!m) return;
+      const alreadyRead = Array.isArray(m.readBy) && m.readBy.includes(myId);
+      if (!alreadyRead && m.senderId !== myId) {
+        try {
+          s.emit("mark_read", { messageId: m.id }, (ack) => { if (ack && !ack.ok) console.warn("mark_read ack error", ack); });
+        } catch (e) {
+          console.warn("mark_read emit failed", e);
+        }
+      }
+    });
+  }, [visibleMessages, connected, user]);
+
+  // safe getter
+  const getSocket = () => socketRef.current;
+
+  // helper to wait for socket to connect
+  const waitForConnect = (s, timeout = 5000) =>
+    new Promise((resolve) => {
+      if (!s) return resolve(false);
+      if (s.connected) return resolve(true);
+      let done = false;
+      const onConnect = () => {
+        if (done) return;
+        done = true;
+        s.off("connect", onConnect);
+        clearTimeout(t);
+        resolve(true);
+      };
+      const t = setTimeout(() => {
+        if (done) return;
+        done = true;
+        try { s.off("connect", onConnect); } catch (e) {}
+        resolve(false);
+      }, timeout);
+      try { s.once("connect", onConnect); } catch (e) { clearTimeout(t); resolve(false); }
+    });
+
+  // Create room: ensure socket exists & connected (create if needed), wait for connect, then emit create_room
+  const createRoom = async () => {
+    const nameRaw = prompt("Room name:");
+    const name = nameRaw?.trim();
+    if (!name) return;
+
+    let s = getSocket();
+
+    // If no socket, create one (same flow as init): request token and create
+    if (!s) {
+      try {
+        const token = await getToken().catch(() => null);
+        const userPayload = { id: user?.id, fullName: user?.fullName || user?.firstName || user?.primaryEmailAddress?.emailAddress || "User" };
+        const created = createSocket(token, userPayload);
+        registerSocket(created);
+        created.connect();
+        s = created;
+      } catch (err) {
+        console.error("[createRoom] failed to create socket:", err);
+        return alert("Unable to connect to server");
+      }
+    }
+
+    // Wait for connection (timeout)
+    const ok = await waitForConnect(s, 5000);
+    if (!ok) {
+      console.error("[createRoom] socket failed to connect in time");
+      return alert("Failed to connect to server — try again");
+    }
+
+    // Emit create_room and handle ack
+    s.emit("create_room", { name }, (res) => {
+      console.info("[app] create_room ack", res);
+      if (!res) return alert("No response from server");
+      if (!res.ok) return alert("Create room failed: " + (res.error || "unknown"));
+      // success: switch to the new room
+      setCurrentRoom(res.room?.name || name);
+      // request fresh rooms snapshot
+      try { s.emit("rooms_request", null); } catch (e) {}
     });
   };
 
-  // scroll to bottom on new message
-  useEffect(() => {
-    const el = messageListRef.current;
-    if (!el) return;
-    // small heuristic: if near bottom, auto-scroll
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 200;
-    if (nearBottom) {
-      el.scrollTop = el.scrollHeight;
+  // Join room: ensure connected then emit join_room (similar guarantees)
+  const joinRoom = async (room) => {
+    if (!room) return;
+    let s = getSocket();
+    if (!s) {
+      try {
+        const token = await getToken().catch(() => null);
+        const userPayload = { id: user?.id, fullName: user?.fullName || user?.firstName || user?.primaryEmailAddress?.emailAddress || "User" };
+        const created = createSocket(token, userPayload);
+        registerSocket(created);
+        created.connect();
+        s = created;
+      } catch (err) {
+        console.error("[joinRoom] failed to create socket:", err);
+        return alert("Unable to connect to server");
+      }
     }
-  }, [messages]);
 
-  // derived count for the header
-  const onlineCount = onlineUsers.filter((u) => u.online).length;
+    const ok = await waitForConnect(s, 5000);
+    if (!ok) {
+      console.error("[joinRoom] socket failed to connect in time");
+      return alert("Failed to connect to server — try again");
+    }
 
-	// Add: ensure handleSend exists (called by the Send button)
-	const handleSend = () => {
-		// socketInstance should be created by handleConnect; guard for absence
-		if (!socketInstance) {
-			setLastError("Not connected");
-			console.warn("[send] abort: no socket instance");
-			return;
-		}
-		const text = (input || "").trim();
-		if (!text) return;
+    s.emit("join_room", { room }, (res) => {
+      console.info("[app] join_room ack", res);
+      if (!res) return alert("No response from server");
+      if (!res.ok) return alert("Join failed: " + (res.error || "unknown"));
+      setCurrentRoom(room);
+      // server will send room_messages via "room_messages" event — UI will receive them via registerSocket handlers
+    });
+  };
 
-		try {
-			socketInstance.emit("message", { room: "global", text }, (ack) => {
-				// optional: handle server ack
-				console.info("[send] ack", ack);
-			});
-			setInput("");
-		} catch (e) {
-			console.error("[send] emit failed", e);
-			setLastError(e?.message || String(e));
-		}
-	};
+  // Single, canonical sendMessageToRoom implementation (remove duplicates)
+  const sendMessageToRoom = React.useCallback(() => {
+    const s = getSocket();
+    if (!s) {
+      setLastError("Not connected");
+      return;
+    }
+    const text = (input || "").trim();
+    if (!text) return;
 
-	// Add manualReconnect which safely tears down any existing socket and triggers handleConnect
-	const manualReconnect = async () => {
-		// If there's an existing socket instance, clean it up first
-		if (socketInstance) {
-			try {
-				socketInstance.removeAllListeners();
-				socketInstance.disconnect();
-			} catch (e) {
-				console.warn("[reconnect] cleanup failed", e);
-			}
-			setSocketInstance(null);
-			setConnectionStatus("disconnected");
-		}
-		// Call existing connect flow
-		try {
-			await handleConnect();
-		} catch (e) {
-			console.error("[reconnect] handleConnect failed", e);
-			setLastError(e?.message || String(e));
-			setConnectionStatus("error");
-		}
-	};
+    // send message to the current room with server ack
+    try {
+      s.emit("message", { room: currentRoom || "global", text }, (ack) => {
+        if (ack && !ack.ok) {
+          console.warn("message ack error", ack);
+        }
+      });
+    } catch (err) {
+      console.error("emit message failed", err);
+      setLastError(String(err));
+    }
 
-	// Create room (prompt or input-based)
-	const createRoom = async () => {
-		const name = prompt("Room name:");
-		if (!name) return;
-		socket?.emit("create_room", { name }, (res) => {
-			if (res?.ok) {
-				setCurrentRoom(name);
-				// auto-join newly created room
-				socket.emit("join_room", { room: name }, (r) => {
-					console.info("joined new room", r);
-				});
-			} else {
-				alert("Failed to create room: " + (res?.error || "unknown"));
-			}
-		});
-	};
+    setInput("");
+  }, [input, currentRoom]);
 
-	// Join room
-	const joinRoom = (room) => {
-		if (!socket) {
-			alert("Not connected");
-			return;
-		}
-		socket.emit("join_room", { room }, (res) => {
-			if (res?.ok) {
-				setCurrentRoom(room);
-				// room messages will arrive via room_messages handler
-			} else {
-				console.warn("join_room failed", res);
-				alert("Failed to join room: " + (res?.error || "unknown"));
-			}
-		});
-	};
+  // UI (kept simple)
+  return (
+    <>
+      <SignedIn>
+        <div className="app-shell">
+          <div className="container">
+            <header className="app-header">
+              <div className="brand">
+                <div className="logo">RC</div>
+                <div className="title">
+                  <div className="app-name">{appName}</div>
+                  <div className="app-tag">Fast · Secure · Realtime</div>
+                </div>
+              </div>
 
-	// Leave room
-	const leaveRoom = (room) => {
-		if (!socket) return;
-		if (room === "global") return alert("Cannot leave global room");
-		socket.emit("leave_room", { room }, (res) => {
-			if (res?.ok) {
-				setCurrentRoom("global");
-			} else {
-				console.warn("leave_room failed", res);
-			}
-		});
-	};
+              <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 12 }}>
+                <div className="badge" title="connection status">
+                  <span className={`status-dot ${connected ? "status-connected" : "status-disconnected"}`} />
+                  <span style={{ color: connected ? "#86efac" : "#fca5a5", fontSize: 13, fontWeight: 600 }}>
+                    {connected ? "connected" : (lastError ? `error: ${lastError}` : "disconnected")}
+                  </span>
+                </div>
 
-	// Render messages filtered by currentRoom
-	const visibleMessages = messages.filter((m) => (m.room || "global") === (currentRoom || "global"));
+                <button className="badge" onClick={() => { const s = getSocket(); if (s) s.connect(); else alert("Connect will be automatic when signed in."); }}>Connect</button>
+                <button className="badge" onClick={() => { const s = getSocket(); if (s) { s.disconnect(); setConnected(false); } }}>Disconnect</button>
 
-	return (
-		<>
-			<SignedIn>
-				<div className="app-shell">
-					<div className="container">
-						<header className="app-header">
-							<div className="brand">
-								<div className="logo">RC</div>
-								<div className="title">
-									<div className="app-name">{appName}</div>
-									<div className="app-tag">Fast · Secure · Realtime</div>
-								</div>
-							</div>
+                <UserButton />
+                <SignOutButton className="badge">Sign out</SignOutButton>
+              </div>
+            </header>
 
-							<div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 12 }}>
-								<div className="badge" style={{ display: "flex", alignItems: "center", gap: 8 }}>
-									<span className={`status-dot ${connectionStatus === "connected" ? "status-connected" : "status-disconnected"}`} />
-									<span style={{ color: connectionStatus === "connected" ? "#86efac" : "#fca5a5", fontSize: 13, fontWeight: 600 }}>{connectionStatus}</span>
-								</div>
-								<button onClick={manualReconnect} className="badge">Reconnect</button>
-								<UserButton />
-								<SignOutButton className="badge">Sign out</SignOutButton>
-							</div>
-						</header>
+            <div className="layout">
+              <aside className="sidebar">
+                <div className="users-card">
+                  <h4>Rooms</h4>
+                  <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                    <button className="btn btn-primary btn--small" onClick={createRoom}>New Room</button>
+                    <button className="btn btn-ghost btn--small" onClick={() => joinRoom("global")}>Global</button>
+                  </div>
 
-						<div className="layout">
-							<aside className="sidebar">
-								<div className="users-card">
-									<h4>Rooms</h4>
-									<div style={{display:'flex', gap:8, marginBottom:8}}>
-										<button className="btn btn-primary btn--small" onClick={createRoom}>New Room</button>
-										<button className="btn btn-ghost btn--small" onClick={() => joinRoom('global')}>Global</button>
-									</div>
-									<div className="users-list">
-										{rooms.map(r => (
-											<div key={r.name} style={{display:'flex', alignItems:'center', gap:8, padding:8, borderRadius:8}}>
-												<div style={{fontWeight:700}}>{r.name}</div>
-												<div style={{marginLeft:'auto', display:'flex', gap:8}}>
-													<button className="btn btn-ghost btn--small" onClick={() => joinRoom(r.name)}>Join</button>
-													{currentRoom === r.name && r.name !== 'global' && <button className="btn btn-outline btn--small" onClick={() => leaveRoom(r.name)}>Leave</button>}
-												</div>
-											</div>
-										))}
-									</div>
-								</div>
-							</aside>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    {rooms.length === 0 ? <div className="empty">No rooms</div> : rooms.map((r) => (
+                      <div key={r.name} style={{ display: "flex", alignItems: "center", gap: 8, padding: 8, borderRadius: 8 }}>
+                        <div style={{ fontWeight: 700 }}>{r.name}</div>
+                        <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+                          <button className="btn btn-ghost btn--small" onClick={() => joinRoom(r.name)}>Join</button>
+                          {currentRoom === r.name && r.name !== "global" && <button className="btn btn-outline btn--small" onClick={() => leaveRoom(r.name)}>Leave</button>}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
 
-							<main className="chat-panel">
-								<div className="chat-header">
-									<h2 style={{ margin: 0 }}>Global Chat</h2>
-									<div style={{ fontSize: 13, color: "var(--muted)" }}>{onlineUsers.filter((u) => u.online).length} online</div>
-								</div>
+                  <hr style={{ margin: "12px 0", borderColor: "rgba(255,255,255,0.03)" }} />
 
-								<div className="chat-card">
-									<div className="message-list" ref={messageListRef}>
-										{visibleMessages.length === 0 ? (
-											<div className="empty">No messages yet</div>
-										) : (
-											visibleMessages.map((m) => {
-												const sent = m.senderId === user?.id || m.senderId === user?.userId;
-												return (
-													<div key={m.id} className={`message-bubble ${sent ? "message-sent" : "message-recv"}`}>
-														<div className="message-meta">
-															<div style={{ fontWeight: 700 }}>{m.senderName}</div>
-															<div>{m.timestamp ? new Date(m.timestamp).toLocaleTimeString() : ""}</div>
-														</div>
-														<div>{m.text}</div>
-													</div>
-												);
-											})
-										)}
-									</div>
+                  <h4>Users</h4>
+                  <div className="users-list" style={{ marginTop: 8 }}>
+                    {onlineUsers.length === 0 ? <div className="empty">No users</div> : onlineUsers.map((u) => (
+                      <div className="user-row" key={u.id}>
+                        <div className="avatar">{initials(u.name)}</div>
+                        <div className="user-meta">
+                          <div className="user-name">{u.name}</div>
+                          <div className="user-status">{u.online ? "Online" : "Offline"}</div>
+                        </div>
+                        <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+                          <button className="btn btn-ghost btn--small" onClick={() => sendPrivateMessage(u.id, u.name)}>PM</button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </aside>
 
-									<div className="composer">
-										<div className="input-box">
-											<input className="input-field" value={input} onChange={(e) => setInput(e.target.value)} placeholder="Type a message..." onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(); } }} />
-										</div>
-										<button onClick={handleSend} className="send-btn">Send</button>
-									</div>
-								</div>
-							</main>
-						</div>
-					</div>
-				</div>
-			</SignedIn>
+              <main className="chat-panel">
+                <div className="chat-header">
+                  <h2 style={{ margin: 0 }}>{currentRoom === "global" ? "Global Chat" : `Room: ${currentRoom}`}</h2>
+                  <div style={{ fontSize: 13, color: "var(--muted)" }}>{onlineCount} online</div>
+                </div>
 
-			<SignedOut>
-				<RedirectToSignIn />
-				<div style={{ minHeight: "70vh", display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", color: "#e6eef8" }}>
-					<h3>Please sign in to access {appName}</h3>
-					<p style={{ color: "#9aa4b2" }}>You will be redirected to the secure sign-in flow.</p>
-					<SignInButton mode="modal">Sign in</SignInButton>
-				</div>
-			</SignedOut>
-		</>
-	);
+                <div className="chat-card">
+                  <div className="message-list" style={{ display: "flex", flexDirection: "column" }}>
+                    {visibleMessages.length === 0 ? (
+                      <div className="empty">No messages yet</div>
+                    ) : (
+                      visibleMessages.map((m) => {
+                        const sent = m.senderId === user?.id || m.senderId === user?.userId;
+                        return (
+                          <div key={m.id || Math.random()} className={`message-bubble ${sent ? "message-sent" : "message-recv"}`} style={{ marginBottom: 10 }}>
+                            <div className="message-meta">
+                              <div style={{ fontWeight: 700 }}>{m.senderName || m.from}</div>
+                              <div>{m.timestamp ? new Date(m.timestamp).toLocaleTimeString() : ""}</div>
+                            </div>
+                            <div>{m.text || m.content}</div>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+
+                  <div className="composer">
+                    <div className="input-box">
+                      <input
+                        className="input-field"
+                        value={input}
+                        onChange={(e) => setInput(e.target.value)}
+                        placeholder="Type a message..."
+                        onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessageToRoom(); } }}
+                      />
+                    </div>
+                    <button onClick={sendMessageToRoom} className="send-btn">Send</button>
+                  </div>
+                </div>
+              </main>
+            </div>
+          </div>
+        </div>
+      </SignedIn>
+
+      <SignedOut>
+        <RedirectToSignIn />
+        <div style={{ minHeight: "70vh", display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", color: "#e6eef8" }}>
+          <h3>Please sign in to access {appName}</h3>
+          <p style={{ color: "#9aa4b2" }}>You will be redirected to the secure sign-in flow.</p>
+          <SignInButton mode="modal">Sign in</SignInButton>
+        </div>
+      </SignedOut>
+    </>
+  );
 }
