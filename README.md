@@ -3,6 +3,14 @@
 Simple real-time chat app (React client + Node.js server) using Socket.IO and MongoDB.  
 This repo contains a client (React) and server (Express + Socket.IO + Mongoose).
 
+## Preview
+<img width="1919" height="966" alt="image" src="https://github.com/user-attachments/assets/48cfd158-a503-4303-8c91-8ad41aaab615" />
+
+## Live link
+-[Vercel deploy(Fronted)](https://real-time-communication-with-socket-kappa.vercel.app/)
+-[Render deployment (Backend)](https://real-time-communication-with-socket-io-i80f.onrender.com)
+
+
 ## Contents
 - client/ — React front-end (hooks useSocket.js)
 - server/ — Node.js back-end (Express, Socket.IO, Mongoose)
@@ -107,5 +115,4 @@ Ensure client socket uses `REACT_APP_SOCKET_URL` or correct host/port
 
 ## License
 MIT
-## Preview
-![alt text](image.png)
+
